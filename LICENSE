@@ -1,0 +1,28 @@
+SuiX Source-Available License
+
+Copyright (c) 2026 ajw72787
+
+Permission is granted to view, read, and study this source code for
+personal, educational, and evaluation purposes, including hackathon
+judging and review.
+
+You may NOT, without prior written permission from the copyright holder:
+
+  - Fork, clone, or copy this repository (or substantial portions of it)
+    to create a competing or derivative project
+  - Deploy this code, or any modified version of it, to any network
+    (mainnet, testnet, or otherwise)
+  - Use this code, in whole or substantial part, in any other product,
+    service, or submission
+
+Limited reuse of small code snippets is permitted with clear attribution
+to this repository.
+
+This is not an open-source license as defined by the OSI. Source-available
+only.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM THE SOFTWARE OR ITS USE.
