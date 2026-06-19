@@ -15,6 +15,7 @@ const GAS_RESERVE_MIST = 100_000_000n;  // 0.1 SUI always ring-fenced for gas
 const DRIFT_THRESHOLD  = 0.04;          // 4% drift triggers yellow status
 const MIN_TRADE_USD    = parseFloat(process.env.MIN_TRADE_USD) || 0.05; // min USD per swap (env-tunable)
 const MIN_HOLDING_USD  = 0.01;          // ignore dust holdings under $0.01
+const MAX_SWAPS        = 15;            // hard cap per rebalance — emit the 15 largest, user re-runs for the rest
 
 // For SUI-less baskets: SUI above this buffer is treated as INVESTABLE funds.
 // Must be >= gas budget (500M MIST) so the wallet can always post the next tx.
@@ -417,22 +418,35 @@ async function analyzeWallet(walletAddress, basketKey, opts = {}) {
 
 // ── Step 4: Generate trades ───────────────────────────────────────────────────
 //
-// TRUE WALLET-AS-PORTFOLIO MODEL:
+// TRUE WALLET-AS-PORTFOLIO MODEL — single-pass convergence.
 //
-// Phase 1 — Stale exits, greedy deficit-aware routing. Each stale token routes
-//   to whichever basket token has the LARGEST REMAINING DEFICIT at that moment.
-//   Stale tokens marked noRoute (no Cetus liquidity) are skipped — they stay in
-//   the wallet and are reported, they never brick the rebalance.
+// ONE shared deficit table is built up front: for every basket token,
+// deficitUsd = (target_weight * totalUsdValue) − current_value. Positive =
+// underweight (a sink that needs buying); negative = overweight (a source).
+// ALL THREE phases draw down this same table, so no two phases ever fill the
+// same target twice and the portfolio lands on weight in a single rebalance.
 //
-// Phase 2 — Cash deploy. USDC and deployable SUI (SUI-less baskets) fan out
-//   proportionally across underweight tokens.
+// Phase 1 — Stale exits. Each stale token sells into the LARGEST remaining
+//   deficit. If the stale token's USD value exceeds that target's deficit, the
+//   swap is sized to the deficit (filling that target exactly to weight) and
+//   the leftover carries to the NEXT largest deficit, repeating until the stale
+//   token is spent. Sizing to the deficit (not dumping the whole balance into
+//   one target) is what removes the overshoot that used to force a second pass.
+//   noRoute stale tokens are reported and left in the wallet, never bricking.
 //
-// Phase 3 — Overweight → underweight direct swaps.
+// Phase 2 — Cash deploy. USDC, then deployable SUI (SUI-less baskets), fill the
+//   largest remaining deficits first, each swap sized to the deficit.
 //
-// Missing-token exemption: a basket token the wallet holds NONE of is always
-// included as underweight, even if its deficit is under MIN_TRADE_USD —
-// otherwise tiny portfolios get stuck on permanent red with a Rebalance
-// button that can't fix it.
+// Phase 3 — Overweight → underweight direct swaps, again sized to the deficit.
+//
+// One swap per (source, target) pairing — we never proportionally spray a
+// single source across every target (that produced the 23–45 swap PTBs that
+// failed). Swaps under MIN_TRADE_USD are skipped unless the target is a token
+// we hold NONE of (missing-token exemption — otherwise tiny portfolios get
+// stuck permanently red with a Rebalance button that can't fix them).
+//
+// Hard cap: at most MAX_SWAPS swaps per rebalance. If more would be needed we
+// emit the largest-impact ones and stop; the user re-runs for the remainder.
 
 function generateTrades(walletAnalysis) {
     const { analysis, totalUsdValue, staleHoldings = [], holdings = [] } = walletAnalysis;
@@ -444,15 +458,28 @@ function generateTrades(walletAnalysis) {
         return trades;
     }
 
-    // ── Phase 1: Stale exits — greedy deficit-aware routing ──────────────────
-
-    const staleTargets = analysis
-        .map(t => ({
+    // ── Shared deficit table — the single source of truth for all 3 phases ───
+    const deficitTable = analysis.map(t => {
+        const targetUsd = t.target_weight * totalUsdValue;
+        return {
             ...t,
-            deficitUsd: Math.max(0, (t.target_weight * totalUsdValue) - t.current_value),
-        }))
-        .filter(t => t.deficitUsd > 0);
+            targetUsd,
+            deficitUsd: targetUsd - t.current_value,            // +underweight / −overweight
+            isMissing:  t.current_value === 0 && t.target_weight > 0.01,
+        };
+    });
 
+    // Underweight sinks, largest deficit first. Missing tokens jump the queue —
+    // completing the index beats polishing drift. Recomputed each call so it
+    // always reflects draw-downs from earlier swaps in this same rebalance.
+    const sinks = () => deficitTable
+        .filter(t => t.deficitUsd > 0)
+        .sort((a, b) => {
+            if (a.isMissing !== b.isMissing) return a.isMissing ? -1 : 1;
+            return b.deficitUsd - a.deficitUsd;
+        });
+
+    // ── Phase 1: Stale exits — sell into deficits, carry leftover onward ─────
     for (const stale of staleHoldings) {
         if (stale.noRoute) {
             console.log(`   ⏭️  Stale: ${stale.symbol} skipped — no liquidity route`);
@@ -465,44 +492,67 @@ function generateTrades(walletAnalysis) {
             : BigInt(stale.rawBalanceStr || '0');
         if (rawBal === 0n) continue;
 
-        staleTargets.sort((a, b) => b.deficitUsd - a.deficitUsd);
+        const staleTotalUsd = stale.usdValue || 0;
 
-        const target = staleTargets[0];
-        if (!target) {
-            console.log(`   🗑️  Stale: ${stale.symbol} → USDC (no underweight target)`);
+        // Unvalued (dashboard-mode) stale token — can't size by deficit, so fall
+        // back to a single whole-balance swap into the largest deficit or USDC.
+        if (staleTotalUsd <= 0) {
+            const target = sinks()[0];
+            const to = target
+                ? { coin_type: target.coin_type, symbol: target.symbol }
+                : { coin_type: USDC_TYPE, symbol: 'USDC' };
+            console.log(`   🔄 Stale: ${stale.symbol} → ${to.symbol} (unvalued, whole balance)`);
             trades.push({
-                action:         'swap',
-                from_coin_type: stale.coinType,
-                from_symbol:    stale.symbol,
-                from_units:     rawBal.toString(),
-                from_decimals:  stale.decimals,
-                to_coin_type:   USDC_TYPE,
-                to_symbol:      'USDC',
-                usd_amount:     stale.usdValue || 0,
-                is_stale:       true,
+                action: 'swap', from_coin_type: stale.coinType, from_symbol: stale.symbol,
+                from_units: rawBal.toString(), from_decimals: stale.decimals,
+                to_coin_type: to.coin_type, to_symbol: to.symbol,
+                usd_amount: 0, is_stale: true,
             });
             continue;
         }
 
-        console.log(`   🔄 Stale: ${stale.symbol} → ${target.symbol} (direct swap)`);
-        trades.push({
-            action:         'swap',
-            from_coin_type: stale.coinType,
-            from_symbol:    stale.symbol,
-            from_units:     rawBal.toString(),
-            from_decimals:  stale.decimals,
-            to_coin_type:   target.coin_type,
-            to_symbol:      target.symbol,
-            usd_amount:     stale.usdValue || 0,
-            is_stale:       true,
-        });
+        // Valued stale token: spend it across deficits, largest first, sizing
+        // each swap to the deficit and carrying the remainder to the next.
+        let remainingUnits = rawBal;
+        let remainingUsd   = staleTotalUsd;
 
-        // With quote-based valuation, usdValue is real — deficit math is exact.
-        // Placeholder fraction only remains for unvalued (dashboard-mode) calls.
-        const estimatedValue = stale.usdValue > 0
-            ? stale.usdValue
-            : totalUsdValue * target.target_weight * 0.1;
-        target.deficitUsd = Math.max(0, target.deficitUsd - estimatedValue);
+        while (remainingUnits > 0n && remainingUsd > 0) {
+            const target = sinks()[0];
+
+            // No real sink left (or only sub-MIN drift remains): dump the rest
+            // to USDC so the stale token fully exits the wallet this pass.
+            if (!target || (target.deficitUsd < MIN_TRADE_USD && !target.isMissing)) {
+                if (remainingUsd < MIN_TRADE_USD) break; // crumb — leave it, not worth a swap
+                console.log(`   🗑️  Stale: ${stale.symbol} → USDC ($${remainingUsd.toFixed(2)}, no deficit left)`);
+                trades.push({
+                    action: 'swap', from_coin_type: stale.coinType, from_symbol: stale.symbol,
+                    from_units: remainingUnits.toString(), from_decimals: stale.decimals,
+                    to_coin_type: USDC_TYPE, to_symbol: 'USDC',
+                    usd_amount: remainingUsd, is_stale: true,
+                });
+                break;
+            }
+
+            const swapUsd = Math.min(remainingUsd, target.deficitUsd);
+            // Last chunk (stale fits inside this deficit) spends ALL remaining
+            // units so rounding never strands stale dust in the wallet.
+            const units = swapUsd >= remainingUsd
+                ? remainingUnits
+                : BigInt(Math.floor(Number(remainingUnits) * (swapUsd / remainingUsd)));
+            if (units === 0n) break;
+
+            console.log(`   🔄 Stale: ${stale.symbol} → ${target.symbol}: $${swapUsd.toFixed(2)}`);
+            trades.push({
+                action: 'swap', from_coin_type: stale.coinType, from_symbol: stale.symbol,
+                from_units: units.toString(), from_decimals: stale.decimals,
+                to_coin_type: target.coin_type, to_symbol: target.symbol,
+                usd_amount: swapUsd, is_stale: true,
+            });
+
+            target.deficitUsd -= swapUsd;
+            remainingUnits    -= units;
+            remainingUsd      -= swapUsd;
+        }
     }
 
     if (skipped.length) {
@@ -510,117 +560,82 @@ function generateTrades(walletAnalysis) {
     }
 
     // ── Phase 2: Cash deploy — USDC, then deployable SUI ─────────────────────
-
-    const usdcHolding   = holdings.find(h => h.isUsdc);
-    const usdcAvailable = usdcHolding?.usdValue || 0;
-    const suiHolding    = holdings.find(h => h.isDeployableSui);
-    const suiAvailable  = suiHolding?.usdValue || 0;
-
-    const overweight  = [];
-    const underweight = [];
-
-    for (const token of analysis) {
-        const targetUsd = token.target_weight * totalUsdValue;
-        const diff      = targetUsd - token.current_value;
-
-        // Missing-token exemption: always buy into a token we hold none of
-        const isMissing = token.current_value === 0 && token.target_weight > 0.01;
-
-        if (!isMissing && Math.abs(diff) < MIN_TRADE_USD) continue;
-
-        if (diff < 0) {
-            const excessUnits = BigInt(Math.floor(
-                Math.abs(diff) / token.price_usd * Math.pow(10, token.decimals)
-            ));
-            overweight.push({ ...token, excessUsd: Math.abs(diff), excessUnits });
-        } else if (diff > 0) {
-            underweight.push({ ...token, deficitUsd: diff, isMissing });
-        }
-    }
-
-    // Missing tokens jump the queue: completing the index beats polishing drift.
-    // Stable sort keeps weight order within each group.
-    underweight.sort((a, b) => (b.isMissing ? 1 : 0) - (a.isMissing ? 1 : 0));
-
+    // Fill largest deficits first, each swap sized to the deficit. Draws down
+    // the SAME shared table phase 1 already touched.
     function deployCash({ label, available, fromCoinType, fromSymbol, fromDecimals, priceUsd }) {
-        if (available < MIN_TRADE_USD) return;
-        const totalDeficit = underweight.reduce((sum, t) => sum + t.deficitUsd, 0);
-        if (totalDeficit <= 0) return;
+        if (available < MIN_TRADE_USD || !priceUsd) return;
+        let remaining = available;
 
-        const toDeploy = Math.min(available, totalDeficit);
+        while (remaining >= MIN_TRADE_USD) {
+            const target = sinks()[0];
+            if (!target) break;
+            if (target.deficitUsd < MIN_TRADE_USD && !target.isMissing) break;
 
-        for (const token of underweight) {
-            if (token.deficitUsd <= 0) continue;
-            const fraction  = token.deficitUsd / totalDeficit;
-            const deployUsd = toDeploy * fraction;
-            if (deployUsd < MIN_TRADE_USD && !token.isMissing) continue;
-            if (deployUsd <= 0) continue;
+            const deployUsd = Math.min(remaining, target.deficitUsd);
+            if (deployUsd < MIN_TRADE_USD && !target.isMissing) break;
 
             const units = BigInt(Math.floor(deployUsd / priceUsd * Math.pow(10, fromDecimals)));
-            if (units === 0n) continue;
+            if (units === 0n) break;
 
-            console.log(`   💰 ${label} → ${token.symbol}: $${deployUsd.toFixed(2)}`);
+            console.log(`   💰 ${label} → ${target.symbol}: $${deployUsd.toFixed(2)}`);
             trades.push({
-                action:         'swap',
-                from_coin_type: fromCoinType,
-                from_symbol:    fromSymbol,
-                from_units:     units.toString(),
-                from_decimals:  fromDecimals,
-                to_coin_type:   token.coin_type,
-                to_symbol:      token.symbol,
-                usd_amount:     deployUsd,
-                is_stale:       false,
+                action: 'swap', from_coin_type: fromCoinType, from_symbol: fromSymbol,
+                from_units: units.toString(), from_decimals: fromDecimals,
+                to_coin_type: target.coin_type, to_symbol: target.symbol,
+                usd_amount: deployUsd, is_stale: false,
             });
 
-            token.deficitUsd -= deployUsd;
+            target.deficitUsd -= deployUsd;
+            remaining         -= deployUsd;
         }
     }
 
+    const usdcHolding = holdings.find(h => h.isUsdc);
+    const suiHolding  = holdings.find(h => h.isDeployableSui);
+
     deployCash({
-        label: 'USDC', available: usdcAvailable,
+        label: 'USDC', available: usdcHolding?.usdValue || 0,
         fromCoinType: USDC_TYPE, fromSymbol: 'USDC',
         fromDecimals: 6, priceUsd: 1.0,
     });
 
     if (suiHolding) {
         deployCash({
-            label: 'SUI', available: suiAvailable,
+            label: 'SUI', available: suiHolding.usdValue || 0,
             fromCoinType: SUI_TYPE, fromSymbol: 'SUI',
             fromDecimals: 9, priceUsd: suiHolding.priceUsd,
         });
     }
 
     // ── Phase 3: Overweight → underweight direct swaps ───────────────────────
+    // Overweight tokens are the negative-deficit rows of the same table.
+    const overweight = deficitTable
+        .filter(t => t.deficitUsd < 0)
+        .map(t => ({ ...t, excessUsd: -t.deficitUsd }));
 
     for (const source of overweight) {
         let remainingExcessUsd = source.excessUsd;
 
-        for (const target of underweight) {
-            if (target.deficitUsd < MIN_TRADE_USD && !target.isMissing) continue;
-            if (target.deficitUsd <= 0) continue;
-            if (remainingExcessUsd <= 0) break;
-            // Crumb-sized excess may still finish filling a MISSING token,
-            // but is not worth spending on ordinary drift correction.
-            if (remainingExcessUsd < MIN_TRADE_USD && !target.isMissing) continue;
+        while (remainingExcessUsd > 0) {
+            const target = sinks()[0];
+            if (!target) break;
+            if (target.deficitUsd < MIN_TRADE_USD && !target.isMissing) break;
+            // Crumb-sized excess may still finish a MISSING token, but isn't
+            // worth spending on ordinary drift.
+            if (remainingExcessUsd < MIN_TRADE_USD && !target.isMissing) break;
 
             const swapUsd   = Math.min(remainingExcessUsd, target.deficitUsd);
             const sellUnits = BigInt(Math.floor(
                 swapUsd / source.price_usd * Math.pow(10, source.decimals)
             ));
-
-            if (sellUnits === 0n) continue;
+            if (sellUnits === 0n) break;
 
             console.log(`   🔄 ${source.symbol} → ${target.symbol}: $${swapUsd.toFixed(2)}`);
             trades.push({
-                action:         'swap',
-                from_coin_type: source.coin_type,
-                from_symbol:    source.symbol,
-                from_units:     sellUnits.toString(),
-                from_decimals:  source.decimals,
-                to_coin_type:   target.coin_type,
-                to_symbol:      target.symbol,
-                usd_amount:     swapUsd,
-                is_stale:       false,
+                action: 'swap', from_coin_type: source.coin_type, from_symbol: source.symbol,
+                from_units: sellUnits.toString(), from_decimals: source.decimals,
+                to_coin_type: target.coin_type, to_symbol: target.symbol,
+                usd_amount: swapUsd, is_stale: false,
             });
 
             remainingExcessUsd -= swapUsd;
@@ -632,8 +647,17 @@ function generateTrades(walletAnalysis) {
         }
     }
 
-    // Sort: stale exits first, then sells, then buys
-    return trades.sort((a, b) => {
+    // ── Hard cap: keep the MAX_SWAPS largest-impact swaps, drop the rest ─────
+    let capped = trades;
+    if (trades.length > MAX_SWAPS) {
+        console.log(`   ⚠️  ${trades.length} swaps needed — capping at ${MAX_SWAPS} largest; re-run to finish the rest`);
+        capped = [...trades]
+            .sort((a, b) => (b.usd_amount || 0) - (a.usd_amount || 0))
+            .slice(0, MAX_SWAPS);
+    }
+
+    // Execution order: stale exits first, then sells, then buys (cash deploys).
+    return capped.sort((a, b) => {
         if (a.is_stale && !b.is_stale) return -1;
         if (!a.is_stale && b.is_stale) return 1;
         const aIsSell = a.from_coin_type !== USDC_TYPE;
