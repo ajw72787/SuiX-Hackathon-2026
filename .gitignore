@@ -1,0 +1,7 @@
+.env
+**/.env
+build/
+node_modules/
+*.keystore
+sui.keystore
+.DS_Store

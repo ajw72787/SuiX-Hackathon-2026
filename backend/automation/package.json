@@ -1,0 +1,19 @@
+{
+  "name": "suix-scanner",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "SuiX Non-Custodial Index Utility — Drift Scanner Service",
+  "scripts": {
+    "start": "node scanner.js",
+    "run-now": "node scanner.js --run-now",
+    "dev": "node --watch scanner.js --run-now"
+  },
+  "dependencies": {
+    "@mysten/seal": "^1.1.3",
+    "@mysten/sui": "^2.16.2",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.0.0",
+    "node-cron": "^3.0.3",
+    "ws": "^8.0.0"
+  }
+}

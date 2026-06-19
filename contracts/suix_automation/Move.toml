@@ -1,0 +1,11 @@
+[package]
+name = "suix_policy"
+version = "0.0.1"
+edition = "2024.beta"
+ 
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+ 
+[addresses]
+suix_policy = "0x0"
+ 

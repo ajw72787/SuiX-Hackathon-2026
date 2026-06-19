@@ -1,0 +1,14 @@
+{
+  "name": "suix-notification-seal-test",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@mysten/seal": "latest",
+    "@mysten/sui": "latest",
+    "dotenv": "latest"
+  },
+  "devDependencies": {
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
