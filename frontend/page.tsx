@@ -682,6 +682,15 @@ export default function UtilityDashboard() {
   const redeemGross  = (walletStatus?.total_usd || 0) * redeemPct / 100;
   const redeemFee    = redeemGross * 0.005;
   const redeemNet    = redeemGross - redeemFee;
+  const suiHolding  = walletStatus?.holdings.find(h => h.symbol === 'SUI');
+  const suiPriceUsd =
+    basketDetail?.weights.find(t => t.symbol === 'SUI')?.price_usd ??
+    (suiHolding && suiHolding.humanAmt > 0 ? suiHolding.usdValue / suiHolding.humanAmt : null);
+  // SUI redeem: existing SUI isn't swapped, so subtract it before converting
+  const existingSuiUsd = suiHolding?.usdValue ?? 0;
+  const suiRedeemGross = Math.max((walletStatus?.total_usd ?? 0) - existingSuiUsd, 0) * (redeemPct / 100);
+  const suiRedeemNet   = suiRedeemGross * (1 - 0.005); // 0.50% fee, mirrors redeemFee
+  const estSuiReceived = suiPriceUsd ? suiRedeemNet / suiPriceUsd : null;
 
   const modePillText =
     activationPhase === 'done' && policyId ? `AUTOMATED · ${driftPct.toFixed(0)}% · ${fmtFreq(freqSecs)}`
@@ -1083,7 +1092,9 @@ export default function UtilityDashboard() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', paddingTop: 18, marginTop: 6, borderTop: `1px solid ${C.line}` }}>
                     <span style={{ fontSize: 13, color: C.inkDim }}>Est. {redeemTo.toUpperCase()} received</span>
                     <span style={{ ...MONO, fontSize: 24, color: '#cfe2ff' }}>
-                      ~{redeemTo === 'sui' ? `${(redeemNet / 3.84).toFixed(4)} SUI` : fmtUsd(redeemNet)}
+                      ~{redeemTo === 'sui'
+                        ? (estSuiReceived != null ? `${estSuiReceived.toFixed(4)} SUI` : '—')
+                        : fmtUsd(redeemNet)}
                     </span>
                   </div>
 
